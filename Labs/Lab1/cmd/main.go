@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"worker-pool-lab/internal/model"
@@ -32,6 +33,9 @@ func main() {
 	var wg sync.WaitGroup
 	wg.Add(numWorkers)
 
+	var accepted uint64
+	var dropped uint64
+
 	// Workers
 	for w := 1; w <= numWorkers; w++ {
 		workerID := w
@@ -44,7 +48,7 @@ func main() {
 		}(workerID)
 	}
 
-	// Producer
+	// Producer (DROP-ON-FULL)
 	go func() {
 		for i := 1; i <= numJobs; i++ {
 			job := model.Job{
@@ -53,19 +57,27 @@ func main() {
 				Created: time.Now(),
 			}
 
-			t0 := time.Now()
-			jobs <- job
-			waited := time.Since(t0)
+			select {
+			case jobs <- job:
+				atomic.AddUint64(&accepted, 1)
+			default:
+				atomic.AddUint64(&dropped, 1)
+			}
 
 			if i%1000 == 0 {
-				fmt.Printf("[producer] job=%d waited=%v queue_len=%d\n",
-					job.ID, waited, len(jobs))
+				fmt.Printf(
+					"[producer] job=%d queue_len=%d accepted=%d dropped=%d\n",
+					i,
+					len(jobs),
+					atomic.LoadUint64(&accepted),
+					atomic.LoadUint64(&dropped),
+				)
 			}
 		}
 		close(jobs)
 	}()
 
-	// Close results after workers finish
+	// Close results
 	go func() {
 		wg.Wait()
 		close(results)
@@ -88,5 +100,10 @@ func main() {
 		}
 	}
 
-	fmt.Printf("all results processed count=%d\n", count)
+	fmt.Printf(
+		"done processed=%d accepted=%d dropped=%d\n",
+		count,
+		atomic.LoadUint64(&accepted),
+		atomic.LoadUint64(&dropped),
+	)
 }
