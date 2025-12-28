@@ -9,9 +9,10 @@ type Job struct {
 }
 
 type Result struct {
-	JobID    int
-	WorkerID int
-	Value    int
-	Latency  time.Duration
-	Err      error
+	JobID      int
+	WorkerID   int
+	Value      int
+	Latency    time.Duration // worker/service time
+	JobCreated time.Time     // when job entered system
+	Err        error
 }
