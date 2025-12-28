@@ -17,14 +17,15 @@ func main() {
 	ctx := context.Background()
 
 	startAll := time.Now()
-	defer func() {
-		fmt.Println("total_runtime:", time.Since(startAll))
-	}()
+	defer func() { fmt.Println("total_runtime:", time.Since(startAll)) }()
 
 	const (
 		numJobs    = 500000
 		queueSize  = 5000
 		numWorkers = 1
+
+		// Phase-3B: If a job waited longer than this, it's "too stale" to process.
+		maxJobAge = 2 * time.Second
 	)
 
 	jobs := make(chan model.Job, queueSize)
@@ -33,22 +34,34 @@ func main() {
 	var wg sync.WaitGroup
 	wg.Add(numWorkers)
 
-	var accepted uint64
-	var dropped uint64
+	var enqueued uint64
+	var droppedAtEnqueue uint64
+	var droppedStale uint64
+	var processed uint64
 
-	// Workers
+	// Workers (drop stale jobs BEFORE processing)
 	for w := 1; w <= numWorkers; w++ {
 		workerID := w
 		go func(id int) {
 			defer wg.Done()
 			for job := range jobs {
+				age := time.Since(job.Created)
+				if age > maxJobAge {
+					ds := atomic.AddUint64(&droppedStale, 1)
+					if ds%500 == 0 {
+						fmt.Printf("[worker] dropped_stale=%d last_age=%s queue_len=%d\n", ds, age, len(jobs))
+					}
+					continue
+				}
+
 				res := worker.Process(ctx, id, job)
 				results <- res
+				atomic.AddUint64(&processed, 1)
 			}
 		}(workerID)
 	}
 
-	// Producer (DROP-ON-FULL)
+	// Producer (still drop-on-full to avoid blocking)
 	go func() {
 		for i := 1; i <= numJobs; i++ {
 			job := model.Job{
@@ -59,18 +72,20 @@ func main() {
 
 			select {
 			case jobs <- job:
-				atomic.AddUint64(&accepted, 1)
+				atomic.AddUint64(&enqueued, 1)
 			default:
-				atomic.AddUint64(&dropped, 1)
+				atomic.AddUint64(&droppedAtEnqueue, 1)
 			}
 
 			if i%1000 == 0 {
 				fmt.Printf(
-					"[producer] job=%d queue_len=%d accepted=%d dropped=%d\n",
+					"[producer] job=%d queue_len=%d enqueued=%d dropped_enqueue=%d dropped_stale=%d processed=%d\n",
 					i,
 					len(jobs),
-					atomic.LoadUint64(&accepted),
-					atomic.LoadUint64(&dropped),
+					atomic.LoadUint64(&enqueued),
+					atomic.LoadUint64(&droppedAtEnqueue),
+					atomic.LoadUint64(&droppedStale),
+					atomic.LoadUint64(&processed),
 				)
 			}
 		}
@@ -83,27 +98,24 @@ func main() {
 		close(results)
 	}()
 
-	// Consumer
+	// Consumer (prints e2e for processed jobs)
 	count := 0
 	for r := range results {
 		count++
 		e2e := time.Since(r.JobCreated)
 
 		if count%1000 == 0 {
-			fmt.Printf(
-				"[result] job=%d worker=%d worker_latency=%s e2e=%s\n",
-				r.JobID,
-				r.WorkerID,
-				r.Latency,
-				e2e,
-			)
+			fmt.Printf("[result] job=%d worker=%d worker_latency=%s e2e=%s\n",
+				r.JobID, r.WorkerID, r.Latency, e2e)
 		}
 	}
 
 	fmt.Printf(
-		"done processed=%d accepted=%d dropped=%d\n",
+		"done results=%d enqueued=%d dropped_enqueue=%d dropped_stale=%d processed=%d\n",
 		count,
-		atomic.LoadUint64(&accepted),
-		atomic.LoadUint64(&dropped),
+		atomic.LoadUint64(&enqueued),
+		atomic.LoadUint64(&droppedAtEnqueue),
+		atomic.LoadUint64(&droppedStale),
+		atomic.LoadUint64(&processed),
 	)
 }
