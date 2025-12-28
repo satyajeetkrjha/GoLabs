@@ -17,16 +17,21 @@ func main() {
 	ctx := context.Background()
 
 	startAll := time.Now()
-	defer func() { fmt.Println("total_runtime:", time.Since(startAll)) }()
+	defer func() {
+		fmt.Println("total_runtime:", time.Since(startAll))
+	}()
 
 	const (
 		numJobs    = 500000
 		queueSize  = 5000
 		numWorkers = 1
-
-		// Phase-3B: If a job waited longer than this, it's "too stale" to process.
-		maxJobAge = 2 * time.Second
 	)
+
+	// Phase 3C: bounded waiting budget for enqueue
+	const enqueueWaitBudget = 2 * time.Millisecond
+
+	// Phase 3B/3C + TTL stale drop in worker
+	const staleTTL = 2 * time.Second
 
 	jobs := make(chan model.Job, queueSize)
 	results := make(chan model.Result, queueSize)
@@ -35,33 +40,36 @@ func main() {
 	wg.Add(numWorkers)
 
 	var enqueued uint64
-	var droppedAtEnqueue uint64
+	var droppedEnqueue uint64 // immediate drop (full + no wait)
+	var droppedTimeout uint64 // waited up to budget, still couldn't enqueue
 	var droppedStale uint64
 	var processed uint64
 
-	// Workers (drop stale jobs BEFORE processing)
+	// Workers
 	for w := 1; w <= numWorkers; w++ {
 		workerID := w
 		go func(id int) {
 			defer wg.Done()
+
 			for job := range jobs {
 				age := time.Since(job.Created)
-				if age > maxJobAge {
-					ds := atomic.AddUint64(&droppedStale, 1)
-					if ds%500 == 0 {
-						fmt.Printf("[worker] dropped_stale=%d last_age=%s queue_len=%d\n", ds, age, len(jobs))
+				if age > staleTTL {
+					n := atomic.AddUint64(&droppedStale, 1)
+					if n%500 == 0 {
+						fmt.Printf("[worker] dropped_stale=%d last_age=%s queue_len=%d\n",
+							n, age, len(jobs))
 					}
 					continue
 				}
 
 				res := worker.Process(ctx, id, job)
-				results <- res
 				atomic.AddUint64(&processed, 1)
+				results <- res
 			}
 		}(workerID)
 	}
 
-	// Producer (still drop-on-full to avoid blocking)
+	// Producer (Phase 3C)
 	go func() {
 		for i := 1; i <= numJobs; i++ {
 			job := model.Job{
@@ -70,51 +78,60 @@ func main() {
 				Created: time.Now(),
 			}
 
+			// Try immediate non-blocking enqueue first (cheap path)
 			select {
 			case jobs <- job:
 				atomic.AddUint64(&enqueued, 1)
+
 			default:
-				atomic.AddUint64(&droppedAtEnqueue, 1)
+				// Queue is full. Phase 3C: wait up to enqueueWaitBudget.
+				t := time.NewTimer(enqueueWaitBudget)
+				select {
+				case jobs <- job:
+					if !t.Stop() {
+						<-t.C
+					}
+					atomic.AddUint64(&enqueued, 1)
+
+				case <-t.C:
+					atomic.AddUint64(&droppedTimeout, 1)
+				}
 			}
 
 			if i%1000 == 0 {
-				fmt.Printf(
-					"[producer] job=%d queue_len=%d enqueued=%d dropped_enqueue=%d dropped_stale=%d processed=%d\n",
+				fmt.Printf("[producer] job=%d queue_len=%d enqueued=%d dropped_enqueue=%d dropped_timeout=%d dropped_stale=%d processed=%d\n",
 					i,
 					len(jobs),
 					atomic.LoadUint64(&enqueued),
-					atomic.LoadUint64(&droppedAtEnqueue),
+					atomic.LoadUint64(&droppedEnqueue),
+					atomic.LoadUint64(&droppedTimeout),
 					atomic.LoadUint64(&droppedStale),
 					atomic.LoadUint64(&processed),
 				)
 			}
 		}
+
 		close(jobs)
 	}()
 
-	// Close results
+	// Close results after workers finish
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// Consumer (prints e2e for processed jobs)
+	// Consumer
 	count := 0
 	for r := range results {
 		count++
-		e2e := time.Since(r.JobCreated)
-
-		if count%1000 == 0 {
-			fmt.Printf("[result] job=%d worker=%d worker_latency=%s e2e=%s\n",
-				r.JobID, r.WorkerID, r.Latency, e2e)
-		}
+		_ = r // keep it if you want to print e2e every N like earlier
 	}
 
-	fmt.Printf(
-		"done results=%d enqueued=%d dropped_enqueue=%d dropped_stale=%d processed=%d\n",
+	fmt.Printf("done results=%d enqueued=%d dropped_enqueue=%d dropped_timeout=%d dropped_stale=%d processed=%d\n",
 		count,
 		atomic.LoadUint64(&enqueued),
-		atomic.LoadUint64(&droppedAtEnqueue),
+		atomic.LoadUint64(&droppedEnqueue),
+		atomic.LoadUint64(&droppedTimeout),
 		atomic.LoadUint64(&droppedStale),
 		atomic.LoadUint64(&processed),
 	)
