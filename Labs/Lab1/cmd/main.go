@@ -27,10 +27,13 @@ func main() {
 		queueSizeIngest  = 5000
 		queueSizeProcess = 100
 
-		// Stage A: fast workers (like cheap processors)
+		// Results buffering: should usually be bigger than processQ because it’s after the slow stage.
+		queueSizeResults = 5000
+
+		// Stage A: fast workers
 		numStageAWorkers = 8
 
-		// Stage B: exporter workers (slow) — now with retry/backoff
+		// Stage B: exporter workers (slow) — retry/backoff
 		numStageBWorkers = 8
 	)
 
@@ -43,14 +46,24 @@ func main() {
 
 	// Phase 6: Retry policy (exporter realism)
 	const (
-		retryMaxElapsed = 3 * time.Second // per-job retry budget (like exporter retry max elapsed)
+		retryMaxElapsed = 3 * time.Second
 		backoffBase     = 50 * time.Millisecond
 		backoffMax      = 500 * time.Millisecond
 	)
 
+	// Results publish policy (StageB -> results)
+	// In real collectors, exporters should not block forever on downstream consumers.
+	const resultsWaitBudget = 2 * time.Millisecond // bounded wait before we drop result
+	const dropResultsOnFull = true                 // if false, we will block (not recommended)
+
 	ingestQ := make(chan model.Job, queueSizeIngest)
 	processQ := make(chan model.Job, queueSizeProcess)
-	results := make(chan model.Result, queueSizeProcess)
+
+	// StageB writes here
+	results := make(chan model.Result, queueSizeResults)
+
+	// Consumer reads from here (drained by a single goroutine)
+	consQ := make(chan model.Result, queueSizeResults)
 
 	// Counters
 	var produced uint64
@@ -69,11 +82,30 @@ func main() {
 	var droppedStale uint64
 	var processed uint64
 
-	var stageBAttempts uint64       // total attempts (including retries)
-	var stageBFailures uint64       // failed attempts (transient errors)
-	var stageBRetried uint64        // how many times we decided to retry
-	var stageBGaveUp uint64         // dropped because retry budget exceeded
-	var stageBBackoffSleepNs uint64 // time spent sleeping in backoff (sum)
+	var stageBAttempts uint64
+	var stageBFailures uint64
+	var stageBRetried uint64
+	var stageBGaveUp uint64
+	var stageBBackoffSleepNs uint64
+
+	// Results path counters
+	var resultsEnq uint64
+	var resultsDropFull uint64
+	var resultsDropTimeout uint64
+
+	// ---- Results drainer (decouples StageB from consumer) ----
+	// This makes "consumer slowness" not directly stall StageB.
+	// If consumer is slower than production, consQ will fill — then the drainer blocks,
+	// and StageB only blocks/drops according to the results publish policy below.
+	var drainWG sync.WaitGroup
+	drainWG.Add(1)
+	go func() {
+		defer drainWG.Done()
+		for r := range results {
+			consQ <- r // blocking is fine here; this goroutine is the only place we allow it.
+		}
+		close(consQ)
+	}()
 
 	// ---- Stage B workers (exporter with retry/backoff) ----
 	var wgB sync.WaitGroup
@@ -95,7 +127,6 @@ func main() {
 					continue
 				}
 
-				// Per-job retry budget (like exporter retry max elapsed)
 				deadline := time.Now().Add(retryMaxElapsed)
 				backoff := backoffBase
 
@@ -105,8 +136,33 @@ func main() {
 					res := worker.Process(ctx, id, job)
 					if res.Err == nil {
 						atomic.AddUint64(&processed, 1)
-						// NOTE: this can block if consumer lags; Phase-5 will address that.
-						results <- res
+
+						// FIX: results send must not silently become the bottleneck.
+						// We enforce bounded behavior here.
+						if dropResultsOnFull {
+							// fast path: try immediate send
+							select {
+							case results <- res:
+								atomic.AddUint64(&resultsEnq, 1)
+							default:
+								// optional: bounded wait before dropping
+								t := time.NewTimer(resultsWaitBudget)
+								select {
+								case results <- res:
+									if !t.Stop() {
+										<-t.C
+									}
+									atomic.AddUint64(&resultsEnq, 1)
+								case <-t.C:
+									atomic.AddUint64(&resultsDropTimeout, 1)
+								}
+							}
+						} else {
+							// Not recommended, but kept as an option: fully blocking send.
+							results <- res
+							atomic.AddUint64(&resultsEnq, 1)
+						}
+
 						break
 					}
 
@@ -123,20 +179,18 @@ func main() {
 						break
 					}
 
-					// Retry budget exceeded => give up (bounded retry)
+					// Retry budget exceeded => give up
 					if time.Now().After(deadline) {
 						atomic.AddUint64(&stageBGaveUp, 1)
 						break
 					}
 
-					// We will retry
 					atomic.AddUint64(&stageBRetried, 1)
 
 					// Exponential backoff with jitter (0.5x..1.5x)
-					jitterFactor := 0.5 + rand.Float64() // [0.5, 1.5)
+					jitterFactor := 0.5 + rand.Float64()
 					sleepFor := time.Duration(float64(backoff) * jitterFactor)
 
-					// Cap sleep to not exceed remaining retry budget
 					remaining := time.Until(deadline)
 					if sleepFor > remaining {
 						sleepFor = remaining
@@ -145,7 +199,6 @@ func main() {
 					atomic.AddUint64(&stageBBackoffSleepNs, uint64(sleepFor.Nanoseconds()))
 					time.Sleep(sleepFor)
 
-					// Exponential growth with cap
 					next := backoff * 2
 					if next > backoffMax {
 						next = backoffMax
@@ -168,7 +221,6 @@ func main() {
 			for job := range ingestQ {
 				atomic.AddUint64(&stageARead, 1)
 
-				// FAST work (cheap processor cost)
 				time.Sleep(time.Duration(1+rand.Intn(3)) * time.Millisecond)
 
 				// Forward into processQ with IMMEDIATE DROP if full
@@ -182,13 +234,13 @@ func main() {
 		}(stageAID)
 	}
 
-	// Close processQ after all Stage A workers finish (only senders to processQ are Stage A)
+	// Close processQ after Stage A finishes
 	go func() {
 		wgA.Wait()
 		close(processQ)
 	}()
 
-	// Close results after Stage B workers finish (only senders to results are Stage B)
+	// Close results after Stage B finishes
 	go func() {
 		wgB.Wait()
 		close(results)
@@ -205,13 +257,10 @@ func main() {
 				Created: time.Now(),
 			}
 
-			// Cheap path: immediate non-blocking enqueue
 			select {
 			case ingestQ <- job:
 				atomic.AddUint64(&enqIngest, 1)
-
 			default:
-				// ingestQ is full
 				if !allowWaitOnFull {
 					atomic.AddUint64(&dropIngestFull, 1)
 					continue
@@ -232,12 +281,16 @@ func main() {
 			if i%1000 == 0 {
 				sleepMs := float64(atomic.LoadUint64(&stageBBackoffSleepNs)) / 1e6
 				fmt.Printf(
-					"[producer] job=%d ingest_len=%d process_len=%d produced=%d enq_ingest=%d drop_ingest_full=%d drop_ingest_timeout=%d "+
+					"[producer] job=%d ingest_len=%d process_len=%d results_len=%d cons_len=%d "+
+						"produced=%d enq_ingest=%d drop_ingest_full=%d drop_ingest_timeout=%d "+
 						"stageA_read=%d enq_process=%d drop_process_full=%d dropped_stale=%d processed=%d "+
-						"b_attempts=%d b_fail=%d b_retry=%d b_giveup=%d b_backoff_ms=%.1f\n",
+						"b_attempts=%d b_fail=%d b_retry=%d b_giveup=%d b_backoff_ms=%.1f "+
+						"results_enq=%d results_drop_timeout=%d\n",
 					i,
 					len(ingestQ),
 					len(processQ),
+					len(results),
+					len(consQ),
 					atomic.LoadUint64(&produced),
 					atomic.LoadUint64(&enqIngest),
 					atomic.LoadUint64(&dropIngestFull),
@@ -252,25 +305,31 @@ func main() {
 					atomic.LoadUint64(&stageBRetried),
 					atomic.LoadUint64(&stageBGaveUp),
 					sleepMs,
+					atomic.LoadUint64(&resultsEnq),
+					atomic.LoadUint64(&resultsDropTimeout),
 				)
 			}
 		}
 
-		close(ingestQ) // only producer sends to ingestQ
+		close(ingestQ)
 	}()
 
-	// ---- Consumer ----
+	// ---- Consumer (read from consQ, not results) ----
 	count := 0
-	for r := range results {
+	for r := range consQ {
 		count++
 		_ = r
 	}
+
+	// Ensure drainer exited (it will, since consQ closes after results closes)
+	drainWG.Wait()
 
 	sleepMs := float64(atomic.LoadUint64(&stageBBackoffSleepNs)) / 1e6
 	fmt.Printf(
 		"done results=%d produced=%d enq_ingest=%d drop_ingest_full=%d drop_ingest_timeout=%d "+
 			"stageA_read=%d enq_process=%d drop_process_full=%d dropped_stale=%d processed=%d "+
-			"b_attempts=%d b_fail=%d b_retry=%d b_giveup=%d b_backoff_ms=%.1f\n",
+			"b_attempts=%d b_fail=%d b_retry=%d b_giveup=%d b_backoff_ms=%.1f "+
+			"results_enq=%d results_drop_full=%d results_drop_timeout=%d\n",
 		count,
 		atomic.LoadUint64(&produced),
 		atomic.LoadUint64(&enqIngest),
@@ -286,5 +345,8 @@ func main() {
 		atomic.LoadUint64(&stageBRetried),
 		atomic.LoadUint64(&stageBGaveUp),
 		sleepMs,
+		atomic.LoadUint64(&resultsEnq),
+		atomic.LoadUint64(&resultsDropFull),
+		atomic.LoadUint64(&resultsDropTimeout),
 	)
 }
