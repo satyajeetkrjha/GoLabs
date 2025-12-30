@@ -1,3 +1,4 @@
+// cmd/main.go
 package main
 
 import (
@@ -33,6 +34,11 @@ func main() {
 	// Phase 3B/3C + TTL stale drop in worker
 	const staleTTL = 2 * time.Second
 
+	// Option B knob:
+	// - true  => on full queue, wait up to enqueueWaitBudget to enqueue
+	// - false => on full queue, drop immediately (no waiting)
+	const allowWaitOnFull = true
+
 	jobs := make(chan model.Job, queueSize)
 	results := make(chan model.Result, queueSize)
 
@@ -64,12 +70,14 @@ func main() {
 
 				res := worker.Process(ctx, id, job)
 				atomic.AddUint64(&processed, 1)
+
+				// This may block if consumer lags and results fills up.
 				results <- res
 			}
 		}(workerID)
 	}
 
-	// Producer (Phase 3C)
+	// Producer (Phase 3C + Option B immediate drop tier)
 	go func() {
 		for i := 1; i <= numJobs; i++ {
 			job := model.Job{
@@ -78,16 +86,24 @@ func main() {
 				Created: time.Now(),
 			}
 
-			// Try immediate non-blocking enqueue first (cheap path)
+			// Cheap path: try immediate non-blocking enqueue
 			select {
 			case jobs <- job:
 				atomic.AddUint64(&enqueued, 1)
 
 			default:
-				// Queue is full. Phase 3C: wait up to enqueueWaitBudget.
+				// Queue is full.
+				if !allowWaitOnFull {
+					// Immediate drop tier (true "droppedEnqueue")
+					atomic.AddUint64(&droppedEnqueue, 1)
+					continue
+				}
+
+				// Bounded-wait tier
 				t := time.NewTimer(enqueueWaitBudget)
 				select {
 				case jobs <- job:
+					// Cleanup timer correctly to avoid leaks/races
 					if !t.Stop() {
 						<-t.C
 					}
