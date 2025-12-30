@@ -1,4 +1,3 @@
-// cmd/main.go
 package main
 
 import (
@@ -23,131 +22,185 @@ func main() {
 	}()
 
 	const (
-		numJobs    = 500000
-		queueSize  = 5000
-		numWorkers = 1
+		numJobs = 500000
+
+		queueSizeIngest  = 5000
+		queueSizeProcess = 100
+
+		// Stage A: fast workers (like cheap processors)
+		numStageAWorkers = 8
+
+		// Stage B: slow workers (like exporters)
+		numStageBWorkers = 8
 	)
 
-	// Phase 3C: bounded waiting budget for enqueue
+	// Producer enqueue policy (into ingestQ)
 	const enqueueWaitBudget = 2 * time.Millisecond
+	const allowWaitOnFull = true // if false => immediate drop when ingestQ full
 
-	// Phase 3B/3C + TTL stale drop in worker
+	// Stale TTL check in Stage B (slow stage)
 	const staleTTL = 2 * time.Second
 
-	// Option B knob:
-	// - true  => on full queue, wait up to enqueueWaitBudget to enqueue
-	// - false => on full queue, drop immediately (no waiting)
-	const allowWaitOnFull = true
+	ingestQ := make(chan model.Job, queueSizeIngest)
+	processQ := make(chan model.Job, queueSizeProcess)
+	results := make(chan model.Result, queueSizeProcess)
 
-	jobs := make(chan model.Job, queueSize)
-	results := make(chan model.Result, queueSize)
+	// Counters (separate by stage so you can SEE pressure move)
+	var produced uint64
 
-	var wg sync.WaitGroup
-	wg.Add(numWorkers)
+	// Producer -> ingestQ
+	var enqIngest uint64
+	var dropIngestFull uint64
+	var dropIngestTimeout uint64
 
-	var enqueued uint64
-	var droppedEnqueue uint64 // immediate drop (full + no wait)
-	var droppedTimeout uint64 // waited up to budget, still couldn't enqueue
+	// Stage A -> processQ
+	var stageARead uint64
+	var enqProcess uint64
+	var dropProcessFull uint64 // Stage A drops when processQ is full (immediate)
+
+	// Stage B
 	var droppedStale uint64
 	var processed uint64
 
-	// Workers
-	for w := 1; w <= numWorkers; w++ {
+	// ---- Stage B workers (slow) ----
+	var wgB sync.WaitGroup
+	wgB.Add(numStageBWorkers)
+
+	for w := 1; w <= numStageBWorkers; w++ {
 		workerID := w
 		go func(id int) {
-			defer wg.Done()
+			defer wgB.Done()
 
-			for job := range jobs {
+			for job := range processQ {
 				age := time.Since(job.Created)
 				if age > staleTTL {
 					n := atomic.AddUint64(&droppedStale, 1)
 					if n%500 == 0 {
-						fmt.Printf("[worker] dropped_stale=%d last_age=%s queue_len=%d\n",
-							n, age, len(jobs))
+						fmt.Printf("[stageB] dropped_stale=%d last_age=%s processQ_len=%d\n",
+							n, age, len(processQ))
 					}
 					continue
 				}
 
 				res := worker.Process(ctx, id, job)
 				atomic.AddUint64(&processed, 1)
-
-				// This may block if consumer lags and results fills up.
 				results <- res
 			}
 		}(workerID)
 	}
 
-	// Producer (Phase 3C + Option B immediate drop tier)
+	// ---- Stage A workers (fast) ----
+	var wgA sync.WaitGroup
+	wgA.Add(numStageAWorkers)
+
+	for w := 1; w <= numStageAWorkers; w++ {
+		stageAID := w
+		go func(id int) {
+			defer wgA.Done()
+
+			for job := range ingestQ {
+				atomic.AddUint64(&stageARead, 1)
+
+				// FAST work (simulate cheap processor cost)
+				// Keep this tiny; otherwise you blur the lesson.
+				time.Sleep(time.Duration(1+rand.Intn(3)) * time.Millisecond)
+
+				// Forward into processQ with IMMEDIATE DROP if full.
+				// This is intentional: shed load BEFORE expensive Stage B.
+				select {
+				case processQ <- job:
+					atomic.AddUint64(&enqProcess, 1)
+				default:
+					atomic.AddUint64(&dropProcessFull, 1)
+				}
+			}
+		}(stageAID)
+	}
+
+	// Close processQ after all Stage A workers finish
+	go func() {
+		wgA.Wait()
+		close(processQ)
+	}()
+
+	// Close results after Stage B workers finish
+	go func() {
+		wgB.Wait()
+		close(results)
+	}()
+
+	// ---- Producer -> ingestQ ----
 	go func() {
 		for i := 1; i <= numJobs; i++ {
+			atomic.AddUint64(&produced, 1)
+
 			job := model.Job{
 				ID:      i,
 				Payload: i * 10,
 				Created: time.Now(),
 			}
 
-			// Cheap path: try immediate non-blocking enqueue
+			// Cheap path: immediate non-blocking enqueue to ingestQ
 			select {
-			case jobs <- job:
-				atomic.AddUint64(&enqueued, 1)
+			case ingestQ <- job:
+				atomic.AddUint64(&enqIngest, 1)
 
 			default:
-				// Queue is full.
+				// ingestQ is full
 				if !allowWaitOnFull {
-					// Immediate drop tier (true "droppedEnqueue")
-					atomic.AddUint64(&droppedEnqueue, 1)
+					atomic.AddUint64(&dropIngestFull, 1)
 					continue
 				}
 
-				// Bounded-wait tier
 				t := time.NewTimer(enqueueWaitBudget)
 				select {
-				case jobs <- job:
-					// Cleanup timer correctly to avoid leaks/races
+				case ingestQ <- job:
 					if !t.Stop() {
 						<-t.C
 					}
-					atomic.AddUint64(&enqueued, 1)
-
+					atomic.AddUint64(&enqIngest, 1)
 				case <-t.C:
-					atomic.AddUint64(&droppedTimeout, 1)
+					atomic.AddUint64(&dropIngestTimeout, 1)
 				}
 			}
 
 			if i%1000 == 0 {
-				fmt.Printf("[producer] job=%d queue_len=%d enqueued=%d dropped_enqueue=%d dropped_timeout=%d dropped_stale=%d processed=%d\n",
+				fmt.Printf("[producer] job=%d ingest_len=%d process_len=%d produced=%d enq_ingest=%d drop_ingest_full=%d drop_ingest_timeout=%d stageA_read=%d enq_process=%d drop_process_full=%d dropped_stale=%d processed=%d\n",
 					i,
-					len(jobs),
-					atomic.LoadUint64(&enqueued),
-					atomic.LoadUint64(&droppedEnqueue),
-					atomic.LoadUint64(&droppedTimeout),
+					len(ingestQ),
+					len(processQ),
+					atomic.LoadUint64(&produced),
+					atomic.LoadUint64(&enqIngest),
+					atomic.LoadUint64(&dropIngestFull),
+					atomic.LoadUint64(&dropIngestTimeout),
+					atomic.LoadUint64(&stageARead),
+					atomic.LoadUint64(&enqProcess),
+					atomic.LoadUint64(&dropProcessFull),
 					atomic.LoadUint64(&droppedStale),
 					atomic.LoadUint64(&processed),
 				)
 			}
 		}
 
-		close(jobs)
+		close(ingestQ)
 	}()
 
-	// Close results after workers finish
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Consumer
+	// ---- Consumer ----
 	count := 0
 	for r := range results {
 		count++
-		_ = r // keep it if you want to print e2e every N like earlier
+		_ = r
 	}
 
-	fmt.Printf("done results=%d enqueued=%d dropped_enqueue=%d dropped_timeout=%d dropped_stale=%d processed=%d\n",
+	fmt.Printf("done results=%d produced=%d enq_ingest=%d drop_ingest_full=%d drop_ingest_timeout=%d stageA_read=%d enq_process=%d drop_process_full=%d dropped_stale=%d processed=%d\n",
 		count,
-		atomic.LoadUint64(&enqueued),
-		atomic.LoadUint64(&droppedEnqueue),
-		atomic.LoadUint64(&droppedTimeout),
+		atomic.LoadUint64(&produced),
+		atomic.LoadUint64(&enqIngest),
+		atomic.LoadUint64(&dropIngestFull),
+		atomic.LoadUint64(&dropIngestTimeout),
+		atomic.LoadUint64(&stageARead),
+		atomic.LoadUint64(&enqProcess),
+		atomic.LoadUint64(&dropProcessFull),
 		atomic.LoadUint64(&droppedStale),
 		atomic.LoadUint64(&processed),
 	)
